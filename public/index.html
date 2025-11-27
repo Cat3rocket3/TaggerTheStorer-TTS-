@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Tagged File Browser</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="app-header">
+        <h1>Tagged File Browser</h1>
+      </header>
+
+      <main class="app-main">
+        <aside class="folders-panel">
+          <div class="panel-title">Folders</div>
+          <div id="folderBreadcrumb" class="breadcrumb"></div>
+          <ul id="folderList" class="folder-list"></ul>
+          <div class="folder-actions">
+            <input
+              type="text"
+              id="newFolderName"
+              placeholder="New folder name"
+            />
+            <button id="btnCreateFolder">Create Folder</button>
+          </div>
+        </aside>
+
+        <section class="files-panel">
+          <div class="search-bar">
+            <input
+              type="text"
+              id="searchInput"
+              placeholder="Search files by name..."
+            />
+            <button id="btnSearch">Search</button>
+            <button id="btnClearSearch">Clear</button>
+            <button id="btnRefresh" title="Refresh files">🔄</button>
+            <button id="btnOpenUpload">Upload...</button>
+          </div>
+
+          <button id="btnBack" class="back-button hidden">← Back</button>
+
+          <div id="tagFilterBar" class="tag-filter-bar"></div>
+
+          <table class="file-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Tags</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="fileTableBody"></tbody>
+          </table>
+        </section>
+      </main>
+    </div>
+
+    <!-- Upload popup -->
+    <div id="uploadModal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Upload to current folder</h2>
+          <button id="uploadClose" class="close-btn">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="upload-row">
+            <button id="btnChooseFiles">Choose files</button>
+            <button id="btnChooseFolder">Choose folder</button>
+            <span id="uploadSelectedInfo" class="upload-info">
+              No files selected
+            </span>
+          </div>
+
+          <div class="upload-row">
+            <label for="uploadNewTags">New tags (comma-separated):</label>
+            <input
+              type="text"
+              id="uploadNewTags"
+              placeholder="e.g. school, cats, programming"
+            />
+          </div>
+
+          <div class="upload-row">
+            <div class="upload-tags-title">Existing tags:</div>
+            <div id="uploadTagList" class="upload-tag-list"></div>
+          </div>
+
+          <!-- Upload progress area -->
+          <div class="upload-row upload-progress-row hidden" id="uploadProgressRow">
+            <div class="progress-wrapper">
+              <div class="progress-bar-bg">
+                <div id="uploadProgressBar" class="progress-bar-fill" style="width:0%"></div>
+              </div>
+              <div class="progress-info">
+                <span id="uploadPercent">0%</span>
+                <span id="uploadSpeed">0 KB/s</span>
+                <span id="uploadETA">—</span>
+                <span id="uploadSize">0 / 0</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button id="btnStartUpload">Start upload</button>
+        </div>
+      </div>
+
+      <!-- Hidden file inputs -->
+      <input type="file" id="fileInput" multiple hidden />
+      <input
+        type="file"
+        id="folderInput"
+        multiple
+        webkitdirectory
+        hidden
+      />
+    </div>
+
+    <!-- Tag editor modal -->
+    <div id="tagEditorModal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Edit Tag</h2>
+          <button id="tagEditorClose" class="close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="upload-row">
+            <label for="tagEditName">Name:</label>
+            <input type="text" id="tagEditName" />
+          </div>
+          <div class="upload-row">
+            <label for="tagEditColor">Color:</label>
+            <input type="color" id="tagEditColor" />
+            <input type="text" id="tagEditColorHex" placeholder="#rrggbb" />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="btnDeleteTag" class="danger">Delete</button>
+          <button id="btnCreateTag">Create</button>
+          <button id="btnSaveTag">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- File sidebar -->
+    <aside id="fileSidebar" class="file-sidebar hidden">
+      <div class="sidebar-header">
+        <div id="fileSidebarTitle">File</div>
+        <button id="fileSidebarClose" class="close-btn">✕</button>
+      </div>
+      <div class="sidebar-body">
+        <div class="upload-tags-title">Tags</div>
+        <div id="fileTagList" class="upload-tag-list"></div>
+      </div>
+      <div class="sidebar-footer">
+        <button id="btnSaveFileTags">Save</button>
+      </div>
+    </aside>
+
+    <!-- Settings button -->
+    <button id="settingsToggle" class="settings-btn" title="Settings">⚙</button>
+
+    <!-- Settings modal -->
+    <div id="settingsModal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Theme settings</h2>
+          <button id="settingsClose" class="close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="upload-row">
+            <label for="settingsBgPanel">Panel background:</label>
+            <input type="color" id="settingsBgPanel" />
+            <input type="text" id="settingsBgPanelHex" placeholder="#rrggbb" />
+            <button id="btnResetPanel" class="reset-btn" title="Reset to default">Default</button>
+          </div>
+          <div class="upload-row">
+            <label for="settingsBgFiles">Files background:</label>
+            <input type="color" id="settingsBgFiles" />
+            <input type="text" id="settingsBgFilesHex" placeholder="#rrggbb" />
+            <button id="btnResetFiles" class="reset-btn" title="Reset to default">Default</button>
+          </div>
+          <div class="upload-row">
+            <label for="settingsBgFilesDark">Files darker (hover):</label>
+            <input type="color" id="settingsBgFilesDark" />
+            <input type="text" id="settingsBgFilesDarkHex" placeholder="#rrggbb" />
+            <button id="btnResetFilesDark" class="reset-btn" title="Reset to default">Default</button>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="btnSaveSettings">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

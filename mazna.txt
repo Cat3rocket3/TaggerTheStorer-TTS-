@@ -1,0 +1,105 @@
+-- Drop old stuff if needed (optional)
+-- DROP TABLE FileTags;
+-- DROP TABLE Files;
+-- DROP TABLE Tags;
+-- DROP TABLE Folders;
+Create database mazna2
+------------------------------------------------------------
+-- FOLDERS
+------------------------------------------------------------
+CREATE TABLE Folders (
+    Id          INT IDENTITY(1,1) PRIMARY KEY,
+    Name        NVARCHAR(255) NOT NULL,
+    ParentId    INT NULL,
+    FullPath    NVARCHAR(1000) NOT NULL,   -- e.g. /root/folder/sub
+    CreatedAt   DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+);
+
+-- No cascade here to avoid multiple cascade path problems.
+ALTER TABLE Folders
+ADD CONSTRAINT FK_Folders_Parent
+FOREIGN KEY (ParentId) REFERENCES Folders(Id);
+
+CREATE UNIQUE INDEX UX_Folders_FullPath ON Folders(FullPath);
+
+------------------------------------------------------------
+-- TAGS
+------------------------------------------------------------
+CREATE TABLE Tags (
+    Id        INT IDENTITY(1,1) PRIMARY KEY,
+    Name      NVARCHAR(100) NOT NULL,
+    Slug      NVARCHAR(100) NOT NULL UNIQUE,
+    ColorHex  CHAR(7) NULL,     -- e.g. #ff00aa
+    IconUrl   NVARCHAR(500) NULL
+);
+
+------------------------------------------------------------
+-- FILES
+------------------------------------------------------------
+CREATE TABLE Files (
+    Id          INT IDENTITY(1,1) PRIMARY KEY,
+    FolderId    INT NOT NULL,
+    Name        NVARCHAR(255) NOT NULL,
+    StoragePath NVARCHAR(1000) NOT NULL,   -- relative to disk root, e.g. folder1/file.txt
+    SizeBytes   BIGINT NULL,
+    MimeType    NVARCHAR(255) NULL,
+    CreatedAt   DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    UpdatedAt   DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+);
+
+ALTER TABLE Files
+ADD CONSTRAINT FK_Files_Folder
+FOREIGN KEY (FolderId) REFERENCES Folders(Id);
+
+CREATE INDEX IX_Files_Folder ON Files(FolderId);
+CREATE INDEX IX_Files_Name ON Files(Name);
+
+------------------------------------------------------------
+-- FILE TAGS (many-to-many)
+------------------------------------------------------------
+CREATE TABLE FileTags (
+    FileId  INT NOT NULL,
+    TagId   INT NOT NULL,
+    CONSTRAINT PK_FileTags PRIMARY KEY (FileId, TagId)
+);
+
+ALTER TABLE FileTags
+ADD CONSTRAINT FK_FileTags_Files
+FOREIGN KEY (FileId) REFERENCES Files(Id) ON DELETE CASCADE;
+
+ALTER TABLE FileTags
+ADD CONSTRAINT FK_FileTags_Tags
+FOREIGN KEY (TagId) REFERENCES Tags(Id);
+
+------------------------------------------------------------
+-- ROOT FOLDER
+------------------------------------------------------------
+IF NOT EXISTS (SELECT 1 FROM Folders WHERE ParentId IS NULL)
+BEGIN
+    INSERT INTO Folders (Name, ParentId, FullPath)
+    VALUES (N'root', NULL, N'/root');
+END;
+
+
+
+
+
+
+
+
+
+EXEC sp_msforeachtable "ALTER TABLE ? NOCHECK CONSTRAINT ALL";
+
+-- Truncate in the correct dependency order
+TRUNCATE TABLE FileTags;
+TRUNCATE TABLE Files;
+TRUNCATE TABLE Tags;
+TRUNCATE TABLE Folders;
+
+-- Re-enable all constraints
+EXEC sp_msforeachtable "ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL";
+
+-- (Optional) Reseed identity counters to 1
+DBCC CHECKIDENT ('Folders', RESEED, 0);
+DBCC CHECKIDENT ('Tags', RESEED, 0);
+DBCC CHECKIDENT ('Files', RESEED, 0);
