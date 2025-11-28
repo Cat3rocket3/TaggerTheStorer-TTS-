@@ -10,8 +10,18 @@ let uploadState = {
 // Small helpers
 async function apiGet(url) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`GET ${url} failed`);
-  return res.json();
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    let parsed = text;
+    try { parsed = JSON.parse(text); } catch (e) { /* keep raw text */ }
+    const msg = parsed && parsed.error ? parsed.error : (typeof parsed === "string" ? parsed : JSON.stringify(parsed));
+    throw new Error(`GET ${url} failed: ${res.status} ${res.statusText} - ${msg}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    return text;
+  }
 }
 
 async function apiPost(url, body) {
@@ -177,15 +187,16 @@ function renderTagFilters() {
 		cb.dataset.slug = tag.Slug;
 		cb.checked = selectedTagSlugs.has(tag.Slug);
 
-		// prevent checkbox clicks from also opening editor
+		// clicking the checkbox should toggle selection only
 		cb.addEventListener("click", (e) => {
 			e.stopPropagation();
-		});
-
-		cb.addEventListener("change", (e) => {
-			if (cb.checked) selectedTagSlugs.add(tag.Slug);
-			else selectedTagSlugs.delete(tag.Slug);
-			loadFiles().catch(console.error);
+			// toggle handled by checkbox default, then update filters
+			// use setTimeout to allow the checked state to update before reading it
+			setTimeout(() => {
+				if (cb.checked) selectedTagSlugs.add(tag.Slug);
+				else selectedTagSlugs.delete(tag.Slug);
+				loadFiles().catch(console.error);
+			}, 0);
 		});
 
 		const dot = document.createElement("span");
@@ -199,9 +210,11 @@ function renderTagFilters() {
 		bubble.appendChild(dot);
 		bubble.appendChild(span);
 
-		// clicking bubble (not checkbox) opens tag editor
+		// clicking bubble (not checkbox) opens tag editor — prevent label default toggle
 		bubble.addEventListener("click", (e) => {
 			if (e.target === cb) return;
+			e.preventDefault(); // stop checkbox toggling
+			e.stopPropagation();
 			openTagEditor(tag);
 		});
 
@@ -238,9 +251,10 @@ function renderUploadTagList() {
 		cb.dataset.slug = tag.Slug;
 		cb.dataset.id = tag.Id;
 
-		// prevent checkbox clicks from opening editor
+		// clicking checkbox toggles selection only
 		cb.addEventListener("click", (e) => {
 			e.stopPropagation();
+			// let the checkbox update then nothing else here (upload reads checked state)
 		});
 
 		const dot = document.createElement("span");
@@ -254,7 +268,11 @@ function renderUploadTagList() {
 		wrapper.appendChild(dot);
 		wrapper.appendChild(span);
 
-		wrapper.addEventListener("click", () => {
+		// clicking wrapper (not the checkbox) opens the tag editor — prevent checkbox toggle
+		wrapper.addEventListener("click", (e) => {
+			if (e.target === cb) return;
+			e.preventDefault();
+			e.stopPropagation();
 			openTagEditor(tag);
 		});
 
@@ -350,7 +368,7 @@ function renderFiles(files, folders = []) {
         const parts = p.split("|").map(x => x.trim());
         const name = parts[0] || "";
         const color = parts[1] || "#888888";
-        // parts[2] may be slug (unused for display)
+        const slug = parts[2] || (name ? name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9\-]/g, "") : null);
 
         if (!name) return;
 
@@ -371,7 +389,10 @@ function renderFiles(files, folders = []) {
         wrapper.appendChild(span);
 
         wrapper.addEventListener("click", () => {
-          const t = allTags.find((tt) => tt.Name === name);
+          // prefer finding by slug if available, fallback to name
+          let t = null;
+          if (slug) t = allTags.find((tt) => tt.Slug === slug);
+          if (!t) t = allTags.find((tt) => tt.Name === name);
           if (t) openTagEditor(t);
         });
 
@@ -380,18 +401,76 @@ function renderFiles(files, folders = []) {
     }
 
     // Add "plus" button to open folder tag sidebar
-    const addBtn = document.createElement("button");
-    addBtn.className = "tag-add";
-    addBtn.title = "Add / remove tags";
-    addBtn.innerHTML = "+";
-    addBtn.addEventListener("click", (e) => {
+    const addTagBtn = document.createElement("button");
+    addTagBtn.className = "tag-add";
+    addTagBtn.title = "Add / remove tags";
+    addTagBtn.innerHTML = "+";
+    addTagBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       openFolderSidebar(folder);
     });
-    tdTags.appendChild(addBtn);
+    tdTags.appendChild(addTagBtn);
 
+    // Actions cell: download / rename / delete for folders
     const tdActions = document.createElement("td");
-    tdActions.textContent = "";
+
+    const btnDownload = document.createElement("button");
+    btnDownload.className = "btn-download";
+    btnDownload.textContent = "⬇";
+    btnDownload.title = "Download folder";
+    btnDownload.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      // use JS fetch to surface server errors (like missing archiver) and download blob
+      downloadFolderZip(folder);
+    });
+
+    const btnRename = document.createElement("button");
+    btnRename.className = "btn-rename";
+    btnRename.textContent = "✏️";
+    btnRename.title = "Rename folder";
+    btnRename.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const newName = prompt("Rename folder:", folder.Name);
+      if (newName == null) return;
+      const trimmed = newName.trim();
+      if (!trimmed) return;
+      try {
+        await apiPatch(`/api/folder/${folder.Id}`, { name: trimmed });
+        // reload UI and breadcrumb (in case current folder was renamed)
+        await loadFolders();
+        await loadFiles();
+        // refresh currentFolder if it was the one renamed
+        if (currentFolder && currentFolder.Id === folder.Id) {
+          const refreshed = await apiGet(`/api/folder/${folder.Id}`);
+          currentFolder = refreshed;
+          renderBreadcrumb();
+        }
+      } catch (err) {
+        console.error("rename folder", err);
+        alert("Failed to rename folder");
+      }
+    });
+
+    const btnDelete = document.createElement("button");
+    btnDelete.className = "btn-delete";
+    btnDelete.textContent = "🗑";
+    btnDelete.title = "Delete folder";
+    btnDelete.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (!confirm(`Delete folder "${folder.Name}" and ALL its contents?`)) return;
+      try {
+        await apiDelete(`/api/folder/${folder.Id}`);
+        await loadFolders();
+        await loadFiles();
+      } catch (err) {
+        console.error("delete folder", err);
+        alert("Failed to delete folder");
+      }
+    });
+
+    tdActions.appendChild(btnDownload);
+    tdActions.appendChild(btnRename);
+    tdActions.appendChild(btnDelete);
 
     tr.appendChild(tdName);
     tr.appendChild(tdSize);
@@ -424,10 +503,12 @@ function renderFiles(files, folders = []) {
     if (f.TagInfo) {
       const pairs = f.TagInfo.split(",");
       pairs.forEach((p) => {
-        const [name, color] = p.split("|");
+        const parts = p.split("|").map(x => x.trim());
+        const name = parts[0] || "";
+        const color = parts[1] || "#888888";
+        const slug = parts[2] || (name ? name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9\-]/g, "") : null);
         if (!name) return;
 
-        // Use same structure and CSS as tag-bubble so appearance matches
         const wrapper = document.createElement("label");
         wrapper.className = "tag-bubble";
         const tagColor = color || "#888888";
@@ -444,9 +525,11 @@ function renderFiles(files, folders = []) {
         wrapper.appendChild(dot);
         wrapper.appendChild(span);
 
-        // clicking the tag opens the tag editor
+        // clicking the tag opens the tag editor (prefer slug)
         wrapper.addEventListener("click", () => {
-          const t = allTags.find((tt) => tt.Name === name);
+          let t = null;
+          if (slug) t = allTags.find((tt) => tt.Slug === slug);
+          if (!t) t = allTags.find((tt) => tt.Name === name);
           if (t) openTagEditor(t);
         });
 
@@ -699,9 +782,10 @@ function renderUploadTagList() {
 		cb.dataset.slug = tag.Slug;
 		cb.dataset.id = tag.Id;
 
-		// prevent checkbox clicks from opening editor
+		// clicking checkbox toggles selection only
 		cb.addEventListener("click", (e) => {
 			e.stopPropagation();
+			// let the checkbox update then nothing else here (upload reads checked state)
 		});
 
 		const dot = document.createElement("span");
@@ -715,7 +799,11 @@ function renderUploadTagList() {
 		wrapper.appendChild(dot);
 		wrapper.appendChild(span);
 
-		wrapper.addEventListener("click", () => {
+		// clicking wrapper (not the checkbox) opens the tag editor — prevent checkbox toggle
+		wrapper.addEventListener("click", (e) => {
+			if (e.target === cb) return;
+			e.preventDefault();
+			e.stopPropagation();
 			openTagEditor(tag);
 		});
 
@@ -801,13 +889,18 @@ document.getElementById("tagEditColorHex").addEventListener("input", (e) => {
 let currentSidebarFile = null;
 async function openFileSidebar(file) {
   currentSidebarFile = file;
+  currentSidebarFolder = null; // <-- ensure folder state cleared
   const sidebar = document.getElementById("fileSidebar");
   document.getElementById("fileSidebarTitle").textContent = file.Name;
-  document.getElementById("fileTagList").innerHTML = "";
+  const fileTagListEl = document.getElementById("fileTagList");
+  fileTagListEl.innerHTML = "<div class='loading'>Loading tags...</div>";
+  const saveBtn = document.getElementById("btnSaveFileTags");
+  saveBtn.disabled = true;
 
   // fetch tags with selection for this file
   try {
     const data = await apiGet(`/api/file/${file.Id}/tags`);
+    fileTagListEl.innerHTML = "";
     // data: [{Id,Name,Slug,ColorHex, Selected}]
     data.forEach((t) => {
       const wrapper = document.createElement("label");
@@ -820,6 +913,11 @@ async function openFileSidebar(file) {
       cb.checked = !!t.Selected;
       cb.dataset.id = t.Id;
 
+      // prevent checkbox click from bubbling (so it won't open editor)
+      cb.addEventListener("click", (e) => {
+        e.stopPropagation();
+      });
+
       const dot = document.createElement("span");
       dot.className = "tag-dot";
       dot.style.backgroundColor = t.ColorHex || "#888888";
@@ -831,19 +929,24 @@ async function openFileSidebar(file) {
       wrapper.appendChild(dot);
       wrapper.appendChild(span);
 
-      // clicking label (not checkbox) opens tag editor
+      // clicking label (not checkbox) opens tag editor — prevent label default toggle
       wrapper.addEventListener("click", (e) => {
         if (e.target === cb) return;
+        e.preventDefault();
+        e.stopPropagation();
         openTagEditor(t);
       });
 
-      document.getElementById("fileTagList").appendChild(wrapper);
+      fileTagListEl.appendChild(wrapper);
     });
 
+    saveBtn.disabled = false;
     sidebar.classList.remove("hidden");
   } catch (err) {
     console.error("open sidebar", err);
-    alert("Failed to load file tags");
+    fileTagListEl.innerHTML = "";
+    saveBtn.disabled = false;
+    alert("Failed to load file tags: " + (err && err.message ? err.message : String(err)));
   }
 }
 
@@ -855,12 +958,17 @@ document.getElementById("fileSidebarClose").addEventListener("click", () => {
 let currentSidebarFolder = null;
 async function openFolderSidebar(folder) {
   currentSidebarFolder = folder;
+  currentSidebarFile = null; // <-- ensure file state cleared
   const sidebar = document.getElementById("fileSidebar");
   document.getElementById("fileSidebarTitle").textContent = folder.Name + " (Folder)";
-  document.getElementById("fileTagList").innerHTML = "";
+  const fileTagListEl = document.getElementById("fileTagList");
+  fileTagListEl.innerHTML = "<div class='loading'>Loading tags...</div>";
+  const saveBtn = document.getElementById("btnSaveFileTags");
+  saveBtn.disabled = true;
 
   try {
     const data = await apiGet(`/api/folder/${folder.Id}/tags`);
+    fileTagListEl.innerHTML = "";
     data.forEach((t) => {
       const wrapper = document.createElement("label");
       wrapper.className = "tag-bubble upload-tag";
@@ -871,6 +979,11 @@ async function openFolderSidebar(folder) {
       cb.type = "checkbox";
       cb.checked = !!t.Selected;
       cb.dataset.id = t.Id;
+
+      // prevent checkbox click from bubbling (so it won't open editor)
+      cb.addEventListener("click", (e) => {
+        e.stopPropagation();
+      });
 
       const dot = document.createElement("span");
       dot.className = "tag-dot";
@@ -883,19 +996,24 @@ async function openFolderSidebar(folder) {
       wrapper.appendChild(dot);
       wrapper.appendChild(span);
 
-      // clicking label (not checkbox) opens tag editor
+      // clicking label (not checkbox) opens tag editor — prevent label default toggle
       wrapper.addEventListener("click", (e) => {
         if (e.target === cb) return;
+        e.preventDefault();
+        e.stopPropagation();
         openTagEditor(t);
       });
 
-      document.getElementById("fileTagList").appendChild(wrapper);
+      fileTagListEl.appendChild(wrapper);
     });
 
+    saveBtn.disabled = false;
     sidebar.classList.remove("hidden");
   } catch (err) {
     console.error("open folder sidebar", err);
-    alert("Failed to load folder tags");
+    fileTagListEl.innerHTML = "";
+    saveBtn.disabled = false;
+    alert("Failed to load folder tags: " + (err && err.message ? err.message : String(err)));
   }
 }
 
@@ -938,8 +1056,17 @@ document.getElementById("btnCreateTag").addEventListener("click", async () => {
     // POST /api/tags will create or return existing by slug
     await apiPost("/api/tags", { name, colorHex });
     document.getElementById("tagEditorModal").classList.add("hidden");
+
+    // reload global tag list and files
     await loadTags();
     await loadFiles();
+
+    // If a file or folder sidebar is open, refresh it so the new tag appears immediately
+    if (currentSidebarFile) {
+      try { await openFileSidebar(currentSidebarFile); } catch (e) { /* ignore */ }
+    } else if (currentSidebarFolder) {
+      try { await openFolderSidebar(currentSidebarFolder); } catch (e) { /* ignore */ }
+    }
   } catch (err) {
     console.error("create tag", err);
     alert("Failed to create tag");
@@ -1293,5 +1420,30 @@ function stopAutoRefresh() {
 window.addEventListener("beforeunload", () => {
   stopAutoRefresh();
 });
+
+// New helper: download folder zip via fetch so we can show server error messages (e.g. missing archiver)
+function downloadFolderZip(folder) {
+  const id = folder.Id;
+  fetch(`/download-folder/${id}`).then(async (res) => {
+    if (!res.ok) {
+      const txt = await res.text().catch(() => `HTTP ${res.status}`);
+      alert("Folder download failed: " + txt);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const name = (folder.Name || "folder") + ".zip";
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }).catch((err) => {
+    console.error("downloadFolderZip error", err);
+    alert("Folder download failed: " + (err && err.message ? err.message : String(err)));
+  });
+}
 
 //# sourceMappingURL=app.js.map

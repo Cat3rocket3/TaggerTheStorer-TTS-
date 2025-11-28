@@ -520,7 +520,217 @@ async function discoverAndAddNewFiles(folderId, folderPath) {
 }
 
 /* ============================================================
+   RECURSIVE SYNC: discover folders/files on disk (recursive),
+   add missing DB entries and remove DB rows for deleted items.
+   Runs in background (queued).
+============================================================ */
+async function discoverAndSyncFolderRecursive(folderId, folderFullPath) {
+  try {
+    const pool = await getPool();
+    const physBase = fullPathToPhysical(folderFullPath);
+
+    // If folder doesn't exist on disk, nothing to do
+    try {
+      await fsPromises.access(physBase);
+    } catch {
+      return;
+    }
+
+    // Fetch existing folders under the prefix (FullPath LIKE prefix%)
+    const folderPrefix = folderFullPath.endsWith("/") ? folderFullPath + "%" : folderFullPath + "%";
+    const folderRows = await pool
+      .request()
+      .input("Prefix", sql.NVarChar(1000), folderPrefix)
+      .query("SELECT Id, FullPath, ParentId FROM Folders WHERE FullPath LIKE @Prefix;");
+
+    const existingFolderMap = new Map(); // fullPath -> { Id, ParentId }
+    for (const r of folderRows.recordset) existingFolderMap.set(r.FullPath, { Id: r.Id, ParentId: r.ParentId });
+
+    // Collect folder IDs under prefix to query files
+    const folderIds = folderRows.recordset.map(r => r.Id);
+    // Query existing files under those folders
+    let existingFilesMap = new Map(); // storagePath -> { Id, FolderId }
+    if (folderIds.length > 0) {
+      const idsCsv = folderIds.join(",");
+      const rFiles = await pool.request().query(`SELECT Id, StoragePath, FolderId FROM Files WHERE FolderId IN (${idsCsv});`);
+      for (const rf of rFiles.recordset) existingFilesMap.set(String(rf.StoragePath), { Id: rf.Id, FolderId: rf.FolderId });
+    }
+
+    // Walk disk recursively to collect seen folders and files
+    const seenFolders = new Set();
+    const seenFiles = new Set();
+
+    async function walkDir(dir) {
+      let entries;
+      try {
+        entries = await fsPromises.readdir(dir, { withFileTypes: true });
+      } catch (e) {
+        return;
+      }
+      for (const ent of entries) {
+        const fullPath = path.join(dir, ent.name);
+        const rel = path.relative(UPLOAD_ROOT, fullPath).replace(/\\/g, "/"); // e.g. "root/sub"
+        const logicalFullPath = "/" + rel;
+        if (ent.isDirectory()) {
+          seenFolders.add(logicalFullPath);
+          await walkDir(fullPath);
+        } else if (ent.isFile()) {
+          // normalize stored StoragePath to forward slashes (DB uses forward slashes)
+          seenFiles.add(fullPath.replace(/\\/g, "/"));
+        }
+      }
+    }
+
+    await walkDir(physBase);
+
+    // Ensure base folder is included (physBase corresponds to folderFullPath)
+    seenFolders.add(folderFullPath);
+
+    // INSERT missing folders (top-down)
+    // We need to process seenFolders in order of path depth so parents exist first.
+    const seenArr = Array.from(seenFolders);
+    seenArr.sort((a, b) => a.split("/").length - b.split("/").length);
+
+    for (const fFull of seenArr) {
+      if (existingFolderMap.has(fFull)) continue;
+      // compute parentFullPath
+      const idx = fFull.lastIndexOf("/");
+      const parentFull = idx > 0 ? fFull.slice(0, idx) : null;
+      const name = fFull.split("/").pop() || fFull;
+      const parentEntry = parentFull ? existingFolderMap.get(parentFull) : null;
+      const parentIdForInsert = parentEntry ? parentEntry.Id : (folderId || null);
+
+      try {
+        const ins = await pool
+          .request()
+          .input("Name", sql.NVarChar(255), name)
+          .input("ParentId", sql.Int, parentIdForInsert)
+          .input("FullPath", sql.NVarChar(1000), fFull)
+          .query(`
+            INSERT INTO Folders (Name, ParentId, FullPath)
+            OUTPUT INSERTED.*
+            VALUES (@Name, @ParentId, @FullPath);
+          `);
+        const newRow = ins.recordset[0];
+        existingFolderMap.set(fFull, { Id: newRow.Id, ParentId: newRow.ParentId });
+        // add new folder id to list for file queries later
+        folderIds.push(newRow.Id);
+      } catch (err) {
+        console.error("Error inserting discovered folder", fFull, err);
+      }
+    }
+
+    // Re-query existing files map for up-to-date folderIds (in case we added folders)
+    existingFilesMap = new Map();
+    if (folderIds.length > 0) {
+      const idsCsv2 = folderIds.join(",");
+      const rFiles2 = await pool.request().query(`SELECT Id, StoragePath, FolderId FROM Files WHERE FolderId IN (${idsCsv2});`);
+      for (const rf of rFiles2.recordset) existingFilesMap.set(String(rf.StoragePath), { Id: rf.Id, FolderId: rf.FolderId });
+    }
+
+    // INSERT missing files
+    for (const filePath of seenFiles) {
+      if (existingFilesMap.has(filePath)) continue;
+      // determine folder fullPath for this file
+      const dir = path.dirname(filePath);
+      const rel = path.relative(UPLOAD_ROOT, dir).replace(/\\/g, "/"); // 'root/...'
+      const folderFull = "/" + rel;
+      const folderEntry = existingFolderMap.get(folderFull);
+      if (!folderEntry) {
+        // Shouldn't happen because we inserted folders above, but skip if missing
+        console.warn("Missing folder for file, skipping:", filePath, "folderFull:", folderFull);
+        continue;
+      }
+      try {
+        const stat = await fsPromises.stat(filePath);
+        const size = stat.size || 0;
+        const name = path.basename(filePath);
+        await pool
+          .request()
+          .input("FolderId", sql.Int, folderEntry.Id)
+          .input("Name", sql.NVarChar(255), name)
+          .input("StoragePath", sql.NVarChar(1000), filePath.replace(/\\/g, "/"))
+          .input("SizeBytes", sql.BigInt, size)
+          .input("MimeType", sql.NVarChar(255), "application/octet-stream")
+          .query(`
+            INSERT INTO Files (FolderId, Name, StoragePath, SizeBytes, MimeType)
+            VALUES (@FolderId, @Name, @StoragePath, @SizeBytes, @MimeType);
+          `);
+        // optional: log
+        console.log("Discovered and inserted file:", filePath);
+      } catch (err) {
+        console.error("Error inserting discovered file", filePath, err);
+      }
+    }
+
+    // CLEANUP: delete DB files that no longer exist on disk
+    // Get existing DB files under the prefix
+    const rExistsFiles = await pool
+      .request()
+      .input("FolderPrefix", sql.NVarChar(1000), folderPrefix)
+      .query(`
+        SELECT f.Id, f.StoragePath
+        FROM Files f
+        INNER JOIN Folders fo ON fo.Id = f.FolderId
+        WHERE fo.FullPath LIKE @FolderPrefix;
+      `);
+    for (const rf of rExistsFiles.recordset) {
+      const sp = String(rf.StoragePath);
+      if (!seenFiles.has(sp)) {
+        // enqueue cleanup
+        const fileId = rf.Id;
+        jobQueue.enqueue(async () => {
+          try {
+            const p = await getPool();
+            await p
+              .request()
+              .input("FileId", sql.Int, fileId)
+              .query(`
+                DELETE FROM FileTags WHERE FileId=@FileId;
+                DELETE FROM Files WHERE Id=@FileId;
+              `);
+            console.log("Removed DB file for missing disk file:", fileId);
+          } catch (err) {
+            console.error("Error cleaning missing DB file", fileId, err);
+          }
+        });
+      }
+    }
+
+    // CLEANUP: delete DB folders that no longer exist on disk
+    const rExistsFolders = await pool
+      .request()
+      .input("Prefix", sql.NVarChar(1000), folderPrefix)
+      .query(`SELECT Id, FullPath FROM Folders WHERE FullPath LIKE @Prefix;`);
+    for (const rf of rExistsFolders.recordset) {
+      if (!seenFolders.has(rf.FullPath)) {
+        const folderIdToDel = rf.Id;
+        jobQueue.enqueue(async () => {
+          try {
+            const p = await getPool();
+            await p
+              .request()
+              .input("FolderId", sql.Int, folderIdToDel)
+              .query(`
+                DELETE FROM FileTags WHERE FileId IN (SELECT Id FROM Files WHERE FolderId=@FolderId);
+                DELETE FROM Files WHERE FolderId=@FolderId;
+                DELETE FROM Folders WHERE Id=@FolderId;
+              `);
+            console.log("Removed DB folder for missing disk folder:", rf.FullPath);
+          } catch (err) {
+            console.error("Error cleaning missing DB folder", rf.FullPath, err);
+          }
+        });
+      }
+    }
+  } catch (err) {
+    console.error("discoverAndSyncFolderRecursive error", err);
+  }
+}
+
+/* ============================================================
    LIST FILES (with auto cleanup if missing on disk)
+   (enqueue recursive sync instead of shallow discovery)
 ============================================================ */
 app.get("/api/files", async (req, res) => {
   const folderId = req.query.folderId ? parseInt(req.query.folderId, 10) : null;
@@ -534,7 +744,7 @@ app.get("/api/files", async (req, res) => {
   try {
     const pool = await getPool();
 
-    // Get folder path for discovery scan
+    // Get folder path for discovery/sync
     let folderPath = "/root";
     if (folderId) {
       const folderRes = await pool
@@ -546,9 +756,9 @@ app.get("/api/files", async (req, res) => {
       }
     }
 
-    // Run file discovery in background (async, don't wait)
+    // Run recursive sync in background (async, don't wait)
     jobQueue.enqueue(async () => {
-      await discoverAndAddNewFiles(folderId, folderPath);
+      await discoverAndSyncFolderRecursive(folderId, folderPath);
     });
 
     // Query files as before
@@ -597,386 +807,210 @@ app.get("/api/files", async (req, res) => {
 });
 
 /* ============================================================
-   UPLOAD FILES / FOLDERS (Busboy, streaming, temp files)
+   LIST FOLDERS: enqueue recursive sync for this parent
 ============================================================ */
-app.post("/api/upload", (req, res) => {
-  console.log("UPLOAD START");
-  const busboy = createBusboy(req);
+app.get("/api/folders", async (req, res) => {
+  const parentId = req.query.parentId ? parseInt(req.query.parentId, 10) : null;
 
-  const fields = {
-    folderId: null,
-    tagSlugs: [],
-    newTags: [],
-  };
+  try {
+    const pool = await getPool();
 
-  const uploaded = [];
-
-  busboy.on("field", (name, value) => {
-    if (name === "folderId") {
-      const v = (value || "").trim();
-      fields.folderId = v ? parseInt(v, 10) : null;
-    } else if (name === "tagSlugs") {
-      fields.tagSlugs = (value || "")
-        .split(",")
-        .map((x) => x.trim())
-        .filter(Boolean);
-    } else if (name === "newTags") {
-      fields.newTags = (value || "")
-        .split(",")
-        .map((x) => x.trim())
-        .filter(Boolean);
-    }
-  });
-
-  busboy.on("file", (fieldname, file, info, encoding, mimeType) => {
-    let filename;
-    let mime;
-
-    if (typeof info === "string") {
-      // old Busboy: (field, file, filename, encoding, mimetype)
-      filename = info;
-      mime = mimeType || "application/octet-stream";
-    } else if (info && typeof info === "object") {
-      // new Busboy: (field, file, info)
-      filename = info.filename;
-      mime = info.mimeType || info.mimetype || "application/octet-stream";
-    } else {
-      filename = "unnamed";
-      mime = "application/octet-stream";
+    // determine parent full path
+    let parentFullPath = "/root";
+    if (parentId) {
+      const pf = await pool.request().input("Id", sql.Int, parentId).query("SELECT FullPath FROM Folders WHERE Id=@Id");
+      if (pf.recordset.length) parentFullPath = pf.recordset[0].FullPath;
     }
 
-    if (!filename) {
-      file.resume();
-      return;
-    }
-
-    const parts = String(filename).split(/[\\/]/);
-    const baseName = parts.pop();
-    const subDirs = parts.filter(Boolean);
-    const safeName = baseName.replace(/[^\w.\-]+/g, "_");
-
-    const idPart = Date.now() + "-" + Math.random().toString(36).slice(2);
-    const diskPath = path.join(UPLOAD_ROOT, `${idPart}_${safeName}`);
-
-    const writeStream = fs.createWriteStream(diskPath);
-    let size = 0;
-
-    file.on("data", (chunk) => {
-      size += chunk.length;
+    // enqueue recursive sync for parent (background)
+    jobQueue.enqueue(async () => {
+      await discoverAndSyncFolderRecursive(parentId, parentFullPath);
     });
 
-    file.pipe(writeStream);
+    const r = await pool
+      .request()
+      .input("ParentId", sql.Int, parentId)
+      .query(`
+        SELECT 
+          f.Id,
+          f.Name,
+          f.ParentId,
+          f.FullPath,
+          CASE WHEN EXISTS (SELECT 1 FROM Folders c WHERE c.ParentId = f.Id)
+               THEN 1 ELSE 0 END AS HasChildren,
+          -- include slug so the client can filter reliably: Name|ColorHex|Slug
+          STRING_AGG(t.Name + '|' + t.ColorHex + '|' + t.Slug, ',') AS TagInfo
+        FROM Folders f
+        LEFT JOIN FolderTags ft ON ft.FolderId = f.Id
+        LEFT JOIN Tags t ON t.Id = ft.TagId
+        WHERE 
+          (@ParentId IS NULL AND f.ParentId IS NULL)
+          OR f.ParentId = @ParentId
+        GROUP BY f.Id, f.Name, f.ParentId, f.FullPath
+        ORDER BY f.Name;
+      `);
 
-    const donePromise = new Promise((resolve, reject) => {
-      writeStream.on("finish", () => resolve());
-      writeStream.on("error", (err) => reject(err));
-    });
+    // remove folders that no longer exist on disk (async, in background)
+    const existing = [];
+    const cleanupJobs = [];
 
-    uploaded.push({
-      diskPath,
-      safeName,
-      mime,
-      subDirs,
-      sizeRef: () => size,
-      donePromise,
-    });
-  });
-
-  let finishedCalled = false;
-
-  async function handleFinished() {
-    if (finishedCalled) return;
-    finishedCalled = true;
-
-    try {
-      // Wait until all temp files are fully written
-      await Promise.all(uploaded.map((u) => u.donePromise));
-
-      if (!uploaded.length) {
-        console.log("UPLOAD FINISH, no files");
-        return res.status(400).json({ ok: false, error: "No files uploaded" });
-      }
-
-      console.log("UPLOAD FINISH, files seen:", uploaded.length);
-
-      const pool = await getPool();
-
-      // locate base folder
-      let baseFolderId;
-      let baseFullPath;
-
-      if (fields.folderId) {
-        const r = await pool
-          .request()
-          .input("Id", sql.Int, fields.folderId)
-          .query("SELECT * FROM Folders WHERE Id=@Id");
-
-        if (!r.recordset.length) {
-          return res
-            .status(400)
-            .json({ ok: false, error: "Target folder not found" });
-        }
-
-        baseFolderId = r.recordset[0].Id;
-        baseFullPath = r.recordset[0].FullPath;
-      } else {
-        const root = await ensureRootFolder();
-        baseFolderId = root.Id;
-        baseFullPath = root.FullPath;
-      }
-
-      // tags
-      const tagsFinal = [];
-
-      // new tags
-      for (const name of fields.newTags) {
-        const slug = name.toLowerCase().replace(/\s+/g, "-");
-
-        const exists = await pool
-          .request()
-          .input("Slug", sql.NVarChar(100), slug)
-          .query("SELECT Id FROM Tags WHERE Slug=@Slug");
-
-        if (exists.recordset.length) {
-          tagsFinal.push(exists.recordset[0].Id);
-        } else {
-          const color =
-            "#" +
-            Math.floor(Math.random() * 16777215)
-              .toString(16)
-              .padStart(6, "0");
-          const ins = await pool
+    for (const row of r.recordset) {
+      const phys = fullPathToPhysical(row.FullPath);
+      try {
+        await fsPromises.access(phys);
+        existing.push(row);
+      } catch {
+        // folder missing on disk, queue cleanup task
+        cleanupJobs.push(async () => {
+          const p = await getPool();
+          await p
             .request()
-            .input("Name", sql.NVarChar(100), name)
-            .input("Slug", sql.NVarChar(100), slug)
-            .input("ColorHex", sql.NVarChar(7), color)
+            .input("FolderId", sql.Int, row.Id)
             .query(`
-              INSERT INTO Tags (Name, Slug, ColorHex)
-              OUTPUT INSERTED.Id
-              VALUES (@Name, @Slug, @ColorHex);
+              DELETE FROM FileTags WHERE FileId IN (SELECT Id FROM Files WHERE FolderId=@FolderId);
+              DELETE FROM Files WHERE FolderId=@FolderId;
+              DELETE FROM Folders WHERE Id=@FolderId;
             `);
-          tagsFinal.push(ins.recordset[0].Id);
-        }
+        });
       }
-
-      // existing tags by slug
-      for (const slug of fields.tagSlugs) {
-        const r = await pool
-          .request()
-          .input("Slug", sql.NVarChar(100), slug)
-          .query("SELECT Id FROM Tags WHERE Slug=@Slug");
-        if (r.recordset.length) tagsFinal.push(r.recordset[0].Id);
-      }
-
-      // helper to ensure folder chain under base folder
-      async function ensureFolderChain(baseId, basePath, subDirs) {
-        let currentId = baseId;
-        let currentPath = basePath;
-
-        for (const segment of subDirs) {
-          if (!segment) continue;
-          const name = segment.replace(/[\/\\]/g, "");
-
-          const exist = await pool
-            .request()
-            .input("ParentId", sql.Int, currentId)
-            .input("Name", sql.NVarChar(255), name)
-            .query(
-              "SELECT * FROM Folders WHERE ParentId=@ParentId AND Name=@Name"
-            );
-
-          if (exist.recordset.length) {
-            currentId = exist.recordset[0].Id;
-            currentPath = exist.recordset[0].FullPath;
-          } else {
-            const newPath = `${currentPath}/${name}`;
-            await ensureDiskFolder(newPath);
-
-            const ins = await pool
-              .request()
-              .input("Name", sql.NVarChar(255), name)
-              .input("ParentId", sql.Int, currentId)
-              .input("FullPath", sql.NVarChar(1000), newPath)
-              .query(`
-                INSERT INTO Folders (Name, ParentId, FullPath)
-                OUTPUT INSERTED.*
-                VALUES (@Name, @ParentId, @FullPath);
-              `);
-
-            currentId = ins.recordset[0].Id;
-            currentPath = ins.recordset[0].FullPath;
-          }
-        }
-
-        return { folderId: currentId, fullPath: currentPath };
-      }
-
-      const inserted = [];
-
-      for (const up of uploaded) {
-        const chain = await ensureFolderChain(
-          baseFolderId,
-          baseFullPath,
-          up.subDirs
-        );
-
-        const targetDir = await ensureDiskFolder(chain.fullPath);
-        const idPart = Date.now() + "-" + Math.random().toString(36).slice(2);
-        const finalName = `${idPart}_${up.safeName}`;
-        const diskPath = path.join(targetDir, finalName);
-
-        // async rename instead of renameSync
-        await fsPromises.rename(up.diskPath, diskPath);
-
-        const size = up.sizeRef();
-
-        const insF = await pool
-          .request()
-          .input("FolderId", sql.Int, chain.folderId)
-          .input("Name", sql.NVarChar(255), up.safeName)
-          .input(
-            "StoragePath",
-            sql.NVarChar(1000),
-            diskPath.replace(/\\/g, "/")
-          )
-          .input("SizeBytes", sql.BigInt, size)
-          .input("MimeType", sql.NVarChar(255), up.mime || null)
-          .query(`
-            INSERT INTO Files (FolderId, Name, StoragePath, SizeBytes, MimeType)
-            OUTPUT INSERTED.*
-            VALUES (@FolderId, @Name, @StoragePath, @SizeBytes, @MimeType);
-          `);
-
-        const row = insF.recordset[0];
-        inserted.push(row);
-
-        // Replace TVP batch insert with parameterized inserts (avoid DB user-defined type)
-        if (tagsFinal.length > 0) {
-          for (const tid of tagsFinal) {
-            await pool
-              .request()
-              .input("FileId", sql.Int, row.Id)
-              .input("TagId", sql.Int, tid)
-              .query("INSERT INTO FileTags (FileId, TagId) VALUES (@FileId, @TagId);");
-          }
-        }
-      }
-
-      res.json({ ok: true, files: inserted });
-    } catch (err) {
-      console.error("UPLOAD ERROR", err);
-      if (!res.headersSent) {
-        res.status(500).json({ ok: false, error: "Upload failed" });
-      }
-    } finally {
-      // cleanup temp files asynchronously in background
-      jobQueue.enqueue(async () => {
-        for (const up of uploaded) {
-          try {
-            await fsPromises.unlink(up.diskPath);
-          } catch (e) {
-            // ignore if already deleted
-          }
-        }
-      });
     }
+
+    // queue cleanup tasks to background job queue
+    cleanupJobs.forEach((job) => jobQueue.enqueue(job));
+
+    res.json(existing);
+  } catch (err) {
+    console.error("GET /api/folders error", err);
+    res.status(500).json({ error: "Failed" });
   }
-
-  busboy.on("error", (err) => {
-    console.error("BUSBOY ERROR", err);
-    if (!finishedCalled && !res.headersSent) {
-      finishedCalled = true;
-      res.status(500).json({ ok: false, error: "Upload failed (stream error)" });
-    }
-  });
-
-  busboy.on("finish", handleFinished);
-  busboy.on("close", handleFinished);
-
-  req.pipe(busboy);
 });
 
-/* ============================================================
-   DOWNLOAD / DELETE FILE
-============================================================ */
-app.get("/download/:id", async (req, res) => {
+app.get("/api/folder/:id", async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     const pool = await getPool();
     const r = await pool
       .request()
       .input("Id", sql.Int, id)
-      .query("SELECT * FROM Files WHERE Id=@Id");
+      .query("SELECT * FROM Folders WHERE Id=@Id");
 
-    if (!r.recordset.length) return res.sendStatus(404);
+    if (!r.recordset.length) {
+      return res.status(404).json({ error: "Not found" });
+    }
 
-    const file = r.recordset[0];
-    if (!fs.existsSync(file.StoragePath)) return res.sendStatus(404);
-
-    const mime = file.MimeType || "application/octet-stream";
-    const safeName = String(file.Name || "download")
-      .replace(/[\r\n"]/g, "_")
-      .trim();
-    const headerName = encodeURIComponent(safeName);
-
-    res.setHeader("Content-Type", mime);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${headerName}"`
-    );
-
-    fs.createReadStream(file.StoragePath).pipe(res);
-  } catch (e) {
-    console.error("GET /download/:id error", e);
-    res.status(500).end();
+    res.json(r.recordset[0]);
+  } catch (err) {
+    console.error("GET /api/folder/:id error", err);
+    res.status(500).json({ error: "Failed" });
   }
 });
 
-app.delete("/api/file/:id", async (req, res) => {
+app.post("/api/folders", async (req, res) => {
+  const { name, parentId } = req.body || {};
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: "Folder name required" });
+  }
+
+  try {
+    const pool = await getPool();
+
+    let parentPath = "/root";
+    let parentDbId = null;
+
+    if (parentId) {
+      const p = await pool
+        .request()
+        .input("Id", sql.Int, parentId)
+        .query("SELECT * FROM Folders WHERE Id=@Id");
+
+      if (!p.recordset.length) {
+        return res.status(400).json({ error: "Parent not found" });
+      }
+
+      parentDbId = p.recordset[0].Id;
+      parentPath = p.recordset[0].FullPath;
+    }
+
+    const fullPath = `${parentPath}/${name}`;
+
+    await ensureDiskFolder(fullPath);
+
+    const r = await pool
+      .request()
+      .input("Name", sql.NVarChar(255), name)
+      .input("ParentId", sql.Int, parentDbId)
+      .input("FullPath", sql.NVarChar(1000), fullPath)
+      .query(`
+        INSERT INTO Folders (Name, ParentId, FullPath)
+        OUTPUT INSERTED.*
+        VALUES (@Name, @ParentId, @FullPath);
+      `);
+
+    res.status(201).json(r.recordset[0]);
+  } catch (err) {
+    console.error("POST /api/folders error", err);
+    res.status(500).json({ error: "Failed to create folder" });
+  }
+});
+
+app.delete("/api/folder/:id", async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!id) return res.status(400).json({ error: "Invalid id" });
 
   try {
     const pool = await getPool();
-    const r = await pool
+
+    const folderRes = await pool
       .request()
       .input("Id", sql.Int, id)
-      .query("SELECT * FROM Files WHERE Id=@Id");
+      .query("SELECT * FROM Folders WHERE Id=@Id");
 
-    if (!r.recordset.length) {
-      return res.status(404).json({ error: "File not found" });
+    if (!folderRes.recordset.length) {
+      return res.status(404).json({ error: "Folder not found" });
     }
 
-    const file = r.recordset[0];
+    const folder = folderRes.recordset[0];
+    const phys = fullPathToPhysical(folder.FullPath);
 
     await pool
       .request()
-      .input("FileId", sql.Int, id)
+      .input("FullPathPrefix", sql.NVarChar(1000), folder.FullPath + "%")
       .query(`
-        DELETE FROM FileTags WHERE FileId=@FileId;
-        DELETE FROM Files WHERE Id=@FileId;
+        DELETE FT
+        FROM FileTags FT
+        WHERE FT.FileId IN (
+          SELECT Id FROM Files WHERE FolderId IN (
+            SELECT Id FROM Folders WHERE FullPath LIKE @FullPathPrefix
+          )
+        );
+
+        DELETE FROM Files WHERE FolderId IN (
+          SELECT Id FROM Folders WHERE FullPath LIKE @FullPathPrefix
+        );
+
+        DELETE FROM Folders WHERE FullPath LIKE @FullPathPrefix;
       `);
 
-    // async delete file in background
+    // delete folder asynchronously in background
     jobQueue.enqueue(async () => {
       try {
-        if (fs.existsSync(file.StoragePath)) {
-          await fsPromises.unlink(file.StoragePath);
-        }
+        await fsPromises.rm(phys, { recursive: true, force: true });
+        console.log("Cleanup: removed folder", phys);
       } catch (err) {
-        console.error("Cleanup error deleting file", file.StoragePath, err);
+        console.error("Cleanup error for folder", phys, err);
       }
     });
 
     res.json({ ok: true });
   } catch (err) {
-    console.error("DELETE /api/file/:id error", err);
+    console.error("DELETE /api/folder/:id error", err);
     res.status(500).json({ error: "Failed" });
   }
 });
 
-// PATCH to rename file
-app.patch("/api/file/:id", async (req, res) => {
+// PATCH to rename folder (updates FullPath for folder and descendants; attempts disk rename)
+app.patch("/api/folder/:id", async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { name } = req.body || {};
   if (!id) return res.status(400).json({ error: "Invalid id" });
@@ -987,74 +1021,103 @@ app.patch("/api/file/:id", async (req, res) => {
     const r = await pool
       .request()
       .input("Id", sql.Int, id)
-      .input("Name", sql.NVarChar(255), name.trim())
-      .query(`
-        UPDATE Files SET Name=@Name WHERE Id=@Id;
-        SELECT * FROM Files WHERE Id=@Id;
-      `);
+      .query("SELECT * FROM Folders WHERE Id=@Id");
 
-    if (!r.recordset.length) return res.status(404).json({ error: "File not found" });
-    res.json(r.recordset[0]);
-  } catch (err) {
-    console.error("PATCH /api/file/:id error", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
+    if (!r.recordset.length) return res.status(404).json({ error: "Folder not found" });
 
-/* ============================================================
-   FILE TAGS: get tags with selection and set tags for a file
-============================================================ */
-app.get("/api/file/:id/tags", async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  if (!id) return res.status(400).json({ error: "Invalid id" });
-  try {
-    const pool = await getPool();
-    const r = await pool
-      .request()
-      .input("FileId", sql.Int, id)
-      .query(`
-        SELECT
-          t.Id, t.Name, t.Slug, t.ColorHex,
-          CASE WHEN ft.FileId IS NULL THEN 0 ELSE 1 END AS Selected
-        FROM Tags t
-        LEFT JOIN FileTags ft ON ft.TagId = t.Id AND ft.FileId = @FileId
-        ORDER BY t.Name;
-      `);
-    const rows = r.recordset.map(rw => ({ ...rw, Selected: !!rw.Selected }));
-    res.json(rows);
-  } catch (err) {
-    console.error("GET /api/file/:id/tags error", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
-
-app.post("/api/file/:id/tags", async (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const tagIds = Array.isArray(req.body.tagIds) ? req.body.tagIds.map(x => parseInt(x,10)).filter(Boolean) : [];
-  if (!id) return res.status(400).json({ error: "Invalid id" });
-  try {
-    const pool = await getPool();
-    // remove existing, then batch insert provided
-    await pool
-      .request()
-      .input("FileId", sql.Int, id)
-      .query(`DELETE FROM FileTags WHERE FileId=@FileId;`);
-
-    // Avoid using TVP (FileTagList); insert parameterized rows instead
-    if (tagIds.length > 0) {
-      for (const tid of tagIds) {
-        await pool
-          .request()
-          .input("FileId", sql.Int, id)
-          .input("TagId", sql.Int, tid)
-          .query("INSERT INTO FileTags (FileId, TagId) VALUES (@FileId, @TagId);");
-      }
+    const folder = r.recordset[0];
+    const oldFull = folder.FullPath;
+    // determine parent full path
+    let parentFull = "/root";
+    if (folder.ParentId != null) {
+      const p = await pool.request().input("Id", sql.Int, folder.ParentId).query("SELECT FullPath FROM Folders WHERE Id=@Id");
+      if (p.recordset.length) parentFull = p.recordset[0].FullPath;
     }
 
-    res.json({ ok: true });
+    const newFull = `${parentFull}/${name}`;
+
+    // Update FullPath for this folder and all descendants by replacing prefix
+    const oldPrefix = oldFull;
+    const newPrefix = newFull;
+
+    await pool
+      .request()
+      .input("OldPrefix", sql.NVarChar(1000), oldPrefix)
+      .input("NewPrefix", sql.NVarChar(1000), newPrefix)
+      .input("Name", sql.NVarChar(255), name)
+      .input("Id", sql.Int, id)
+      .query(`
+        UPDATE Folders
+        SET FullPath = @NewPrefix + SUBSTRING(FullPath, LEN(@OldPrefix) + 1, 2000)
+        WHERE FullPath LIKE @OldPrefix + '%';
+
+        UPDATE Folders SET Name=@Name WHERE Id=@Id;
+      `);
+
+    // Attempt to rename on disk
+    const oldPhys = fullPathToPhysical(oldFull);
+    const newPhys = fullPathToPhysical(newFull);
+    try {
+      // ensure destination parent exists
+      await fsPromises.mkdir(path.dirname(newPhys), { recursive: true });
+      await fsPromises.rename(oldPhys, newPhys);
+    } catch (err) {
+      // non-fatal: log and continue (DB already updated)
+      console.error("Failed to rename folder on disk:", oldPhys, "->", newPhys, err);
+    }
+
+    const updated = await pool.request().input("Id", sql.Int, id).query("SELECT * FROM Folders WHERE Id=@Id");
+    res.json(updated.recordset[0]);
   } catch (err) {
-    console.error("POST /api/file/:id/tags error", err);
+    console.error("PATCH /api/folder/:id error", err);
     res.status(500).json({ error: "Failed" });
+  }
+});
+
+// GET download folder as zip (streams zip). Requires 'archiver' package.
+app.get("/download-folder/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).send("Invalid id");
+
+    const pool = await getPool();
+    const r = await pool.request().input("Id", sql.Int, id).query("SELECT * FROM Folders WHERE Id=@Id");
+    if (!r.recordset.length) return res.status(404).send("Not found");
+
+    const folder = r.recordset[0];
+    const phys = fullPathToPhysical(folder.FullPath);
+
+    try {
+      await fsPromises.access(phys);
+    } catch {
+      return res.status(404).send("Folder not found on disk");
+    }
+
+    let archiver;
+    try {
+      archiver = require("archiver");
+    } catch (e) {
+      console.error("archiver module not installed:", e);
+      return res.status(500).send("Server missing 'archiver' module. Install with: npm install archiver");
+    }
+
+    const zipName = (folder.Name || "folder") + ".zip";
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(zipName)}"`);
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err) => {
+      console.error("Archive error", err);
+      try { res.status(500).end(); } catch (e) {}
+    });
+
+    archive.pipe(res);
+    // append directory contents; second arg false to avoid nesting with full path
+    archive.directory(phys, false);
+    archive.finalize();
+  } catch (err) {
+    console.error("GET /download-folder/:id error", err);
+    res.status(500).end();
   }
 });
 
@@ -1091,6 +1154,7 @@ app.post("/api/folder/:id/tags", async (req, res) => {
   if (!id) return res.status(400).json({ error: "Invalid id" });
   try {
     const pool = await getPool();
+    // remove existing, then insert provided
     await pool
       .request()
       .input("FolderId", sql.Int, id)
@@ -1114,10 +1178,183 @@ app.post("/api/folder/:id/tags", async (req, res) => {
 });
 
 /* ============================================================
-   ROOT
+   FILE TAGS: get tags with selection and set tags for a file
 ============================================================ */
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+app.get("/api/file/:id/tags", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: "Invalid id" });
+  try {
+    const pool = await getPool();
+    const r = await pool
+      .request()
+      .input("FileId", sql.Int, id)
+      .query(`
+        SELECT
+          t.Id, t.Name, t.Slug, t.ColorHex,
+          CASE WHEN ft.FileId IS NULL THEN 0 ELSE 1 END AS Selected
+        FROM Tags t
+        LEFT JOIN FileTags ft ON ft.TagId = t.Id AND ft.FileId = @FileId
+        ORDER BY t.Name;
+      `);
+    const rows = r.recordset.map(rw => ({ ...rw, Selected: !!rw.Selected }));
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /api/file/:id/tags error", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+app.post("/api/file/:id/tags", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const tagIds = Array.isArray(req.body.tagIds) ? req.body.tagIds.map(x => parseInt(x, 10)).filter(Boolean) : [];
+  if (!id) return res.status(400).json({ error: "Invalid id" });
+  try {
+    const pool = await getPool();
+    // remove existing, then insert provided
+    await pool
+      .request()
+      .input("FileId", sql.Int, id)
+      .query(`DELETE FROM FileTags WHERE FileId=@FileId;`);
+
+    if (tagIds.length > 0) {
+      for (const tid of tagIds) {
+        await pool
+          .request()
+          .input("FileId", sql.Int, id)
+          .input("TagId", sql.Int, tid)
+          .query("INSERT INTO FileTags (FileId, TagId) VALUES (@FileId, @TagId);");
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/file/:id/tags error", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+/* ============================================================
+   DOWNLOAD / DELETE / RENAME FILE
+============================================================ */
+
+// Download a file by id (streams from disk)
+app.get("/download/:id", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.sendStatus(400);
+
+    const pool = await getPool();
+    const r = await pool.request().input("Id", sql.Int, id).query("SELECT * FROM Files WHERE Id=@Id");
+    if (!r.recordset.length) return res.sendStatus(404);
+
+    const file = r.recordset[0];
+    if (!file.StoragePath || !fs.existsSync(file.StoragePath)) return res.sendStatus(404);
+
+    const mime = file.MimeType || "application/octet-stream";
+    const safeName = String(file.Name || "download").replace(/[\r\n"]/g, "_").trim();
+    const headerName = encodeURIComponent(safeName);
+
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Disposition", `attachment; filename="${headerName}"`);
+
+    const stream = fs.createReadStream(file.StoragePath);
+    stream.on("error", (err) => {
+      console.error("stream error", err);
+      try { res.status(500).end(); } catch (e) {}
+    });
+    stream.pipe(res);
+  } catch (err) {
+    console.error("GET /download/:id error", err);
+    res.status(500).end();
+  }
+});
+
+// Delete file (DB + schedule disk deletion)
+app.delete("/api/file/:id", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: "Invalid id" });
+
+  try {
+    const pool = await getPool();
+    const r = await pool.request().input("Id", sql.Int, id).query("SELECT * FROM Files WHERE Id=@Id");
+    if (!r.recordset.length) return res.status(404).json({ error: "File not found" });
+
+    const file = r.recordset[0];
+
+    // remove DB entries
+    await pool.request().input("FileId", sql.Int, id).query(`
+      DELETE FROM FileTags WHERE FileId=@FileId;
+      DELETE FROM Files WHERE Id=@FileId;
+    `);
+
+    // schedule disk delete
+    jobQueue.enqueue(async () => {
+      try {
+        if (file.StoragePath && fs.existsSync(file.StoragePath)) {
+          await fsPromises.unlink(file.StoragePath);
+        }
+      } catch (err) {
+        console.error("Cleanup error deleting file", file.StoragePath, err);
+      }
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /api/file/:id error", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+// PATCH to rename file (updates DB Name; tries to rename file on disk)
+app.patch("/api/file/:id", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { name } = req.body || {};
+  if (!id) return res.status(400).json({ error: "Invalid id" });
+  if (!name || !name.trim()) return res.status(400).json({ error: "Name required" });
+
+  try {
+    const pool = await getPool();
+    const r = await pool.request().input("Id", sql.Int, id).query("SELECT * FROM Files WHERE Id=@Id");
+    if (!r.recordset.length) return res.status(404).json({ error: "File not found" });
+
+    const file = r.recordset[0];
+    const oldName = file.Name || "";
+    const oldPath = file.StoragePath || "";
+
+    // Update DB name
+    await pool.request().input("Id", sql.Int, id).input("Name", sql.NVarChar(255), name.trim()).query(`
+      UPDATE Files SET Name=@Name WHERE Id=@Id;
+    `);
+
+    // Attempt disk rename if storage path exists and extension preserved
+    try {
+      if (oldPath && fs.existsSync(oldPath)) {
+        const dir = path.dirname(oldPath);
+        // preserve extension if any
+        const ext = path.extname(oldName) || "";
+        const newFileName = name.trim() + ext;
+        const newPath = path.join(dir, newFileName);
+        // avoid overwriting existing file silently
+        if (!fs.existsSync(newPath)) {
+          await fsPromises.rename(oldPath, newPath);
+          // update StoragePath in DB to new path
+          await pool.request().input("Id", sql.Int, id).input("StoragePath", sql.NVarChar(1000), newPath.replace(/\\/g, "/")).query(`
+            UPDATE Files SET StoragePath=@StoragePath WHERE Id=@Id;
+          `);
+        } else {
+          console.warn("Target file exists, skipped disk rename:", newPath);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to rename file on disk:", oldPath, err);
+    }
+
+    const updated = await pool.request().input("Id", sql.Int, id).query("SELECT * FROM Files WHERE Id=@Id");
+    res.json(updated.recordset[0]);
+  } catch (err) {
+    console.error("PATCH /api/file/:id error", err);
+    res.status(500).json({ error: "Failed" });
+  }
 });
 
 /* ============================================================
